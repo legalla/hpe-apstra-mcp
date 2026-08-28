@@ -190,19 +190,33 @@ Claude Desktop config:
 
 ---
 
-## Available tools (30 tools)
+## Available tools (61 tools)
+
+### Version & Systems
+- `get_version`                    — Apstra version
+- `list_systems`                   — Managed devices
+- `get_system`                     — Details of a device
+- `list_agents`                    — Apstra agents
 
 ### Blueprints
 - `list_blueprints`                — All blueprints
-- `get_blueprint_anomalies`        — Anomalies of a blueprint
+- `create_blueprint`               — Create a blueprint from a template
+- `get_blueprint_anomalies`        — Runtime anomalies (telemetry)
+- `get_blueprint_build_errors`     — Staging build errors (Uncommitted tab)
+- `get_blueprint_logical_diff`     — Uncommitted logical diff (staging)
 - `get_blueprint_nodes`            — Graph nodes
 - `check_blueprint_commit`         — Validate staging without deploying
-- `commit_blueprint`               — Deploy staged changes
+- `commit_blueprint`               — Deploy staged changes (confirmation required)
 
 ### Virtual Networks
 - `list_virtual_networks`          — VLANs/VXLANs of a blueprint
+- `get_virtual_network`            — Details of a virtual network
 - `create_virtual_network`         — Create a virtual network
+- `update_virtual_network`         — Update a virtual network
 - `delete_virtual_network`         — Delete a virtual network
+- `list_redundancy_groups`         — ESI redundancy groups
+- `list_connectivity_templates`    — Connectivity templates (CT)
+- `apply_ct_to_interfaces`         — Apply a CT to interfaces
 - `enable_vn_dci`                  — Enable DCI (RT2 and/or RT5) on a VN
 
 ### Security / Routing Zones
@@ -210,21 +224,37 @@ Claude Desktop config:
 - `create_security_zone`           — Create a routing zone
 - `enable_sz_dci`                  — Enable DCI (RT5 and/or iRT) on an SZ
 
-### Systems & Agents
-- `list_systems`                   — Managed devices
-- `get_system`                     — Details of a device
-- `list_agents`                    — Apstra agents
-
 ### Generic Systems
 - `create_generic_system`          — Create a server/appliance (auto transformation_id)
 - `list_generic_systems_on_switch` — Servers connected to a switch
 - `get_generic_system_on_port`     — Server on a specific port (or "free port")
 
-### Topology / Properties
+### Topology / Switch properties
 - `get_switch_properties`          — ASN, role, hostname of a switch
 - `get_switch_uplinks`             — Connections of a switch to the Spines
 - `get_link_ips`                   — Point-to-point IPs between two switches
 - `get_switch_loopbacks`           — Loopbacks configured on a switch
+
+### Endpoints, VMs & Cabling (telemetry)
+- `find_endpoint`                  — Locate a learned endpoint (VM/host) by IP/MAC
+- `locate`                         — Locate a MAC/IP (physical vs remote VXLAN)
+- `get_vm_info`                    — VM info (vCenter/NSX integration)
+- `get_fabric_matrix`              — Hierarchical cabling matrix endpoint→leaf→spine
+- `cabling_matrix`                 — Cabling matrix via /cabling-map (A→B links)
+- `list_ports`                     — Ports of a device (status, LACP, CT)
+
+### Health & BGP
+- `get_bgp_status`                 — Real-time state of all BGP peerings
+- `get_fabric_health`              — Fabric health (links, interfaces, alerts)
+
+### Revisions & Staging
+- `list_blueprint_revisions`       — Restore points of a blueprint
+- `rollback_blueprint`             — Roll back to a previous revision
+- `revert_staging`                 — Discard uncommitted staging changes
+
+### VLAN provisioning workflow
+- `prepare_vlan`                   — Pre-flight questionnaire before adding a VLAN
+- `add_vlan_to_port`               — Create a VLAN on a leaf and assign it to a port
 
 ### Resources
 - `list_asn_pools`                 — ASN pools
@@ -237,9 +267,34 @@ Claude Desktop config:
 - `list_rack_types`                — Rack types
 - `list_templates`                 — Datacenter templates
 
-### Tasks & Info
-- `list_tasks` / `get_task`        — Task tracking
-- `get_version`                    — Apstra version
+### Configlets
+- `list_configlets`                — Global configlets
+- `get_configlet`                  — Details of a configlet
+- `list_blueprint_configlets`      — Configlets imported into a blueprint
+- `get_blueprint_configlet`        — Details of a blueprint configlet
+
+### Property Sets
+- `list_property_sets`             — Global property sets
+- `get_property_set`               — Details of a property set
+- `list_blueprint_property_sets`   — Property sets of a blueprint
+- `get_blueprint_property_set`     — Details of a blueprint property set
+
+### Tasks
+- `list_tasks`                     — List tasks
+- `get_task`                       — Task detail
+
+---
+
+## Prompts (guided operations)
+
+Reusable MCP prompt templates exposed alongside the tools:
+
+- `blueprint_health`               — Guided health review of a blueprint
+- `create_virtual_network_guide`   — Step-by-step VN creation
+- `verify_fabric`                  — Fabric verification checklist
+- `deploy_generic_system`          — Guided generic-system deployment
+- `configure_dci`                  — Guided DCI configuration
+- `audit_resources`                — Resource pools audit
 
 ---
 
