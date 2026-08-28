@@ -1,0 +1,30 @@
+# ── Environment / secrets ───────────────────────────────────
+# Real credentials live in .env (never committed); .env.example is the
+# sanitized template that IS committed.
+.env
+.env.*
+!.env.example
+secrets/
+.tokens
+.tokens.tmp
+*.tokens
+
+# ── API specs (large reference files, not distributed) ───────
+openapi*.json
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── Editor / OS ──────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
