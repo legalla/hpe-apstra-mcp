@@ -15,6 +15,32 @@ cp .env.example .env
 
 ---
 
+## Code layout
+
+```
+apstra_client/   ApstraClient REST client (mixins by domain: blueprints,
+                 networks, systems, topology, endpoints, cabling, locate,
+                 revisions, telemetry, vlan, ports, catalog)
+core.py          FastMCP instance, Bearer auth, write-guard, _client()
+tools/           61 @mcp.tool() functions, one module per domain
+dispatch/        Optional flat dispatcher toolset (see below)
+prompts.py       6 guided @mcp.prompt() templates
+server.py        Entry point (imports core + tools + prompts, run())
+```
+
+---
+
+## Tests
+
+Unit tests (no real Apstra controller, no network) live under `tests/`:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest
+```
+
+---
+
 ## Configuration
 
 | Variable           | Description                                    | Default |
@@ -29,6 +55,22 @@ cp .env.example .env
 | `APSTRA_AUTH_ENABLED` | Require a Bearer token on every MCP request | `false` |
 | `APSTRA_TOKENS_FILE`  | Named tokens file                            | `/app/secrets/.tokens` |
 | `APSTRA_TRUST_FORWARDED_FOR` | Trust `X-Forwarded-For` (proxy)       | `false` |
+| `APSTRA_WRITE_ENABLED` | Allow mutating tools (create/update/delete, commit, rollback, revert) | `false` |
+| `APSTRA_FLAT_TOOLSET`  | Collapse the 61 atomic tools into 12 scope/action dispatchers | `false` |
+
+---
+
+## Security: read-only mode by default
+
+By default (`APSTRA_WRITE_ENABLED=false` or unset) this server is **read-only**:
+any tool that creates, updates, deletes, commits, rolls back or reverts something
+(e.g. `create_blueprint`, `commit_blueprint`, `create_virtual_network`,
+`update_virtual_network`, `delete_virtual_network`, `create_security_zone`,
+`create_generic_system`, `apply_ct_to_interfaces`, `enable_vn_dci`,
+`enable_sz_dci`, `add_vlan_to_port`, `rollback_blueprint`, `revert_staging`)
+immediately fails with a `PermissionError` before touching Apstra. Set
+`APSTRA_WRITE_ENABLED=true` (env or `.env`) and restart the container to allow
+these tools. All other (read-only) tools are unaffected.
 
 ---
 
@@ -190,7 +232,42 @@ Claude Desktop config:
 
 ---
 
-## Available tools (61 tools)
+## Flat dispatcher toolset (tool count optimization)
+
+61 atomic tools is a lot for an LLM's tool-selection context. Setting
+`APSTRA_FLAT_TOOLSET=true` (env or `.env`) collapses them into **12 scope/action
+dispatchers** (`dispatch/flat_tools.py`): each dispatcher takes a `scope` (and,
+for writes, an `action`) picking which underlying legacy function to call —
+zero change to `apstra_client/` business logic, and mutating scopes still go
+through `@_require_write` exactly like before. Disabled by default
+(`false`): the 61 legacy tools stay advertised unchanged. Toggling the flag
+only needs `docker compose up -d` (no rebuild) plus reconnecting the MCP
+client (it caches the tool list from the previous session).
+
+| Dispatcher | Replaces | Example scopes |
+|---|---|---|
+| `list_catalog`        | catalog.py (17 tools)        | `asn_pools`, `templates`, `configlet`, `task` |
+| `get_blueprint`       | blueprint reads (6)          | `list`, `anomalies`, `build_errors`, `logical_diff`, `nodes`, `check_commit` |
+| `get_topology`        | topology/systems/ports reads (7) | `switch_properties`, `switch_uplinks`, `generic_systems`, `ports` |
+| `get_cabling`         | cabling.py (2)               | `fabric_matrix`, `cabling_matrix` |
+| `get_network`         | network reads (5)            | `virtual_networks`, `virtual_network`, `security_zones` |
+| `get_system`          | version_systems.py (4)       | `version`, `list`, `info`, `agents` |
+| `get_telemetry`       | telemetry.py (2)             | `bgp_status`, `fabric_health` |
+| `locate`              | endpoint discovery (3)       | `probe`, `endpoint`, `vm` |
+| `configure_blueprint` | blueprint writes (2) ✍️       | `create`, `commit` |
+| `manage_revisions`    | revisions.py (3)             | `list`, `rollback` ✍️, `revert` ✍️ |
+| `configure_network`   | network writes (7) ✍️         | `virtual_network`+`create`/`update`/`delete`, `security_zone`+`create`, … |
+| `configure_fabric`    | generic_system + vlan (3) ✍️  | `generic_system`+`create`, `vlan`+`prepare`/`apply` |
+
+---
+
+## Available tools (61 tools, or 12 dispatchers with `APSTRA_FLAT_TOOLSET=true`)
+
+> ✍️ marks a write tool: blocked with `PermissionError` unless `APSTRA_WRITE_ENABLED=true`
+> (see [Security: read-only mode by default](#security-read-only-mode-by-default)).
+> The tool list below is the legacy/atomic toolset (default). See
+> [Flat dispatcher toolset](#flat-dispatcher-toolset-tool-count-optimization)
+> for the alternative 12-tool mode.
 
 ### Version & Systems
 - `get_version`                    — Apstra version
@@ -200,32 +277,32 @@ Claude Desktop config:
 
 ### Blueprints
 - `list_blueprints`                — All blueprints
-- `create_blueprint`               — Create a blueprint from a template
+- `create_blueprint`               — ✍️ Create a blueprint from a template
 - `get_blueprint_anomalies`        — Runtime anomalies (telemetry)
 - `get_blueprint_build_errors`     — Staging build errors (Uncommitted tab)
 - `get_blueprint_logical_diff`     — Uncommitted logical diff (staging)
 - `get_blueprint_nodes`            — Graph nodes
 - `check_blueprint_commit`         — Validate staging without deploying
-- `commit_blueprint`               — Deploy staged changes (confirmation required)
+- `commit_blueprint`               — ✍️ Deploy staged changes (confirmation required)
 
 ### Virtual Networks
 - `list_virtual_networks`          — VLANs/VXLANs of a blueprint
 - `get_virtual_network`            — Details of a virtual network
-- `create_virtual_network`         — Create a virtual network
-- `update_virtual_network`         — Update a virtual network
-- `delete_virtual_network`         — Delete a virtual network
+- `create_virtual_network`         — ✍️ Create a virtual network
+- `update_virtual_network`         — ✍️ Update a virtual network
+- `delete_virtual_network`         — ✍️ Delete a virtual network
 - `list_redundancy_groups`         — ESI redundancy groups
 - `list_connectivity_templates`    — Connectivity templates (CT)
-- `apply_ct_to_interfaces`         — Apply a CT to interfaces
-- `enable_vn_dci`                  — Enable DCI (RT2 and/or RT5) on a VN
+- `apply_ct_to_interfaces`         — ✍️ Apply a CT to interfaces
+- `enable_vn_dci`                  — ✍️ Enable DCI (RT2 and/or RT5) on a VN
 
 ### Security / Routing Zones
 - `list_security_zones`            — VRFs of a blueprint
-- `create_security_zone`           — Create a routing zone
-- `enable_sz_dci`                  — Enable DCI (RT5 and/or iRT) on an SZ
+- `create_security_zone`           — ✍️ Create a routing zone
+- `enable_sz_dci`                  — ✍️ Enable DCI (RT5 and/or iRT) on an SZ
 
 ### Generic Systems
-- `create_generic_system`          — Create a server/appliance (auto transformation_id)
+- `create_generic_system`          — ✍️ Create a server/appliance (auto transformation_id)
 - `list_generic_systems_on_switch` — Servers connected to a switch
 - `get_generic_system_on_port`     — Server on a specific port (or "free port")
 
@@ -249,12 +326,12 @@ Claude Desktop config:
 
 ### Revisions & Staging
 - `list_blueprint_revisions`       — Restore points of a blueprint
-- `rollback_blueprint`             — Roll back to a previous revision
-- `revert_staging`                 — Discard uncommitted staging changes
+- `rollback_blueprint`             — ✍️ Roll back to a previous revision
+- `revert_staging`                 — ✍️ Discard uncommitted staging changes
 
 ### VLAN provisioning workflow
 - `prepare_vlan`                   — Pre-flight questionnaire before adding a VLAN
-- `add_vlan_to_port`               — Create a VLAN on a leaf and assign it to a port
+- `add_vlan_to_port`               — ✍️ Create a VLAN on a leaf and assign it to a port
 
 ### Resources
 - `list_asn_pools`                 — ASN pools
