@@ -1,4 +1,4 @@
-"""Regression test: server.py must keep registering all 61 tools + 6 prompts
+"""Regression test: server.py must keep registering all 69 tools + 6 prompts
 after the apstra_client.py -> apstra_client/ and server.py -> core.py + tools/
 split (2026-09-14), and mutating tools must stay guarded by @_require_write."""
 
@@ -17,13 +17,14 @@ _MUTATING_TOOLS = {
     "create_virtual_network", "delete_virtual_network", "apply_ct_to_interfaces",
     "enable_vn_dci", "create_security_zone", "enable_sz_dci",
     "create_generic_system", "rollback_blueprint", "revert_staging",
-    "add_vlan_to_port",
+    "add_vlan_to_port", "create_tag", "update_tag", "delete_tag", "set_node_tags",
 }
 
 _READ_ONLY_SAMPLE = {
     "list_blueprints", "get_version", "list_systems", "find_endpoint",
     "locate", "get_fabric_matrix", "cabling_matrix", "list_ports",
     "prepare_vlan",  # preflight only, deliberately NOT write-guarded
+    "resolve_port_interfaces", "list_tags", "find_tagged_nodes", "get_node_tags",
 }
 
 
@@ -49,9 +50,9 @@ def _call_until_guard(fn):
     return fn(*args)
 
 
-def test_all_61_tools_are_registered():
+def test_all_69_tools_are_registered():
     names = set(_tools().keys())
-    assert len(names) == 61
+    assert len(names) == 69
     assert _MUTATING_TOOLS <= names
     assert _READ_ONLY_SAMPLE <= names
 

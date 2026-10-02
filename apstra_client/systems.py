@@ -24,17 +24,24 @@ class SystemsMixin:
 
     # ── Generic Systems ───────────────────────────────────────────────────
 
-    def _normalize_speed(self, speed: str) -> str:
-        return self._SPEED_MAP.get(speed.lower().strip(), speed.upper().strip())
+    def _normalize_speed(self, speed) -> str:
+        """Normalize a port speed. Handles both plain strings ('10G') and the
+        structured {'value': 10, 'unit': 'G'} dicts returned by some Apstra
+        API versions for interface-map interface speeds."""
+        if isinstance(speed, dict):
+            value, unit = speed.get("value"), speed.get("unit", "")
+            speed = f"{value}{unit}" if value is not None else ""
+        return self._SPEED_MAP.get(str(speed).lower().strip(), str(speed).upper().strip())
 
     def _get_switch_interface_map_id(self, blueprint_id: str, switch_id: str) -> str:
         """Retrieve the ID of the interface map assigned to a switch in the blueprint."""
         try:
-            assignments = self._get(f"/blueprints/{blueprint_id}/interface-map-assignments")
-            if switch_id in assignments:
+            data = self._get(f"/blueprints/{blueprint_id}/interface-map-assignments")
+            assignments = data.get("assignments", data) if isinstance(data, dict) else data
+            if switch_id in assignments and assignments[switch_id]:
                 return assignments[switch_id]
             for node_id, im_id in assignments.items():
-                if node_id.startswith(switch_id) or switch_id.startswith(node_id):
+                if im_id and (node_id.startswith(switch_id) or switch_id.startswith(node_id)):
                     return im_id
         except requests.exceptions.RequestException:
             pass
@@ -56,12 +63,12 @@ class SystemsMixin:
         for iface in im.get("interfaces", []):
             s = iface.get("speed") or iface.get("setting", {}).get("speed")
             if s:
-                speeds.add(str(s))
+                speeds.add(self._normalize_speed(s))
         for transform in im.get("transformations", []):
             for iface in transform.get("interfaces", []):
                 s = iface.get("speed")
                 if s:
-                    speeds.add(str(s))
+                    speeds.add(self._normalize_speed(s))
         return sorted(speeds)
 
     def _find_transformation_id(
@@ -78,8 +85,12 @@ class SystemsMixin:
                 or iface.get("setting", {}).get("speed")
                 or (iface.get("setting", {}).get("param") or [{}])[0].get("value")
             )
-            if speed_val and self._normalize_speed(str(speed_val)) == target_speed:
+            if speed_val and self._normalize_speed(speed_val) == target_speed:
                 t_id = iface.get("transformation_id") or iface.get("transformationId")
+                if t_id is None:
+                    mapping = iface.get("mapping")
+                    if mapping and len(mapping) > 1:
+                        t_id = mapping[1]
                 if t_id is not None:
                     return int(t_id)
 

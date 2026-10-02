@@ -11,3 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("APSTRA_HOST", "apstra.example.test")
 os.environ.setdefault("APSTRA_USERNAME", "test-user")
 os.environ.setdefault("APSTRA_PASSWORD", "test-pass")
+
+# A developer .env (loaded by core.load_dotenv) must not change test outcomes.
+os.environ["APSTRA_FLAT_TOOLSET"] = "false"
+os.environ["APSTRA_WRITE_ENABLED"] = "false"

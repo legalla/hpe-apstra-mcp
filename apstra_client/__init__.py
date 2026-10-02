@@ -18,6 +18,7 @@ from .telemetry import TelemetryMixin
 from .vlan import VlanMixin
 from .ports import PortsMixin
 from .catalog import CatalogMixin
+from .tags import TagsMixin
 
 
 class ApstraClient(
@@ -33,6 +34,7 @@ class ApstraClient(
     VlanMixin,
     PortsMixin,
     CatalogMixin,
+    TagsMixin,
     BaseMixin,
 ):
     """HTTP client for the Apstra API (see the mixins above for each domain)."""

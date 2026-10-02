@@ -1,6 +1,6 @@
 """Flat dispatcher toolset for hpe-apstra-mcp (gated by ``APSTRA_FLAT_TOOLSET``).
 
-Same methodology as cx-mcp's dispatch/flat_tools.py: collapse the 61 atomic
+Same methodology as cx-mcp's dispatch/flat_tools.py: collapse the 69 atomic
 ``@mcp.tool()`` functions under tools/ into a small set of scope/action-driven
 dispatchers. Dispatchers only ROUTE to the existing tool-module functions
 (which already carry the write-safety ``_require_write`` gate where needed) —
@@ -9,7 +9,7 @@ zero change to apstra_client/ business logic.
 Activation is gated by ``APSTRA_FLAT_TOOLSET`` (default OFF, safe rollback):
 
     * ``APSTRA_FLAT_TOOLSET=true``  -> legacy tools are de-advertised and the
-      12 flat dispatchers below are advertised instead.
+      14 flat dispatchers below are advertised instead.
     * ``APSTRA_FLAT_TOOLSET=false`` (default) -> no-op, server unchanged.
 
 Call ``install_flat_toolset(mcp)`` once, at the very end of server.py, after
@@ -28,6 +28,7 @@ from tools import (
     systems, telemetry, topology, version_systems,
 )
 from tools import locate as locate_tools
+from tools import tags as tags_tools
 from tools import vlan as vlan_tools
 
 log = logging.getLogger("hpe-apstra-mcp.flat")
@@ -60,6 +61,15 @@ def _err(dispatcher: str, message: str, valid: "list[str] | None" = None) -> dic
     if valid is not None:
         out["valid_scopes"] = valid
     return out
+
+
+def _unsupported_params(dispatcher: str, label: str, p: dict, allowed: list) -> Optional[dict]:
+    """Fail loudly instead of silently ignoring params the action does not take."""
+    extra = sorted(set(p) - set(allowed))
+    if extra:
+        return _err(dispatcher, f"{label}: unsupported params {extra} (they would be ignored). "
+                                f"Accepted: {sorted(allowed)}")
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -116,10 +126,12 @@ def list_catalog(scope: str, id: str = None, blueprint_id: str = None) -> "list 
     ])
 
 
-def get_blueprint(scope: str, blueprint_id: str = None, node_type: str = None) -> "list | dict":
+def get_blueprint(scope: str, blueprint_id: str = None, node_type: str = None,
+                  tags: list = None, tag_match: str = "all") -> "list | dict":
     """Blueprint inspection (read-only). `scope`:
       list | anomalies | build_errors | logical_diff | nodes | check_commit
-    `blueprint_id` required except for `list`. `nodes` accepts `node_type`."""
+    `blueprint_id` required except for `list`. `nodes` accepts `node_type` and
+    `tags` (only nodes carrying the tag(s); `tag_match` 'all'|'any')."""
     if scope == "list":
         return blueprints.list_blueprints()
     if not blueprint_id:
@@ -131,7 +143,7 @@ def get_blueprint(scope: str, blueprint_id: str = None, node_type: str = None) -
     if scope == "logical_diff":
         return blueprints.get_blueprint_logical_diff(blueprint_id)
     if scope == "nodes":
-        return blueprints.get_blueprint_nodes(blueprint_id, node_type)
+        return blueprints.get_blueprint_nodes(blueprint_id, node_type, tags, tag_match)
     if scope == "check_commit":
         return blueprints.check_blueprint_commit(blueprint_id)
     return _err("get_blueprint", f"unknown scope '{scope}'",
@@ -140,12 +152,17 @@ def get_blueprint(scope: str, blueprint_id: str = None, node_type: str = None) -
 
 def get_topology(scope: str, blueprint_id: str = None, switch_id: str = None,
                   switch_id_a: str = None, switch_id_b: str = None,
-                  switch_if: str = None, device: str = None, port: str = None) -> "list | dict":
+                  switch_if: str = None, device: str = None, port: str = None,
+                  port_tags: list = None, system_tags: list = None,
+                  tag_match: str = "all") -> "list | dict":
     """Physical/logical switch topology (read-only). `scope`:
       switch_properties | switch_uplinks | link_ips | switch_loopbacks |
-      generic_systems | generic_system_port | ports
+      generic_systems | generic_system_port | ports | port_interfaces
     `link_ips` needs `switch_id_a`+`switch_id_b`; `generic_system_port` needs
-    `switch_id`+`switch_if`; `ports` uses optional `device`/`port` filters."""
+    `switch_id`+`switch_if`; `ports` uses optional `device`/`port` filters;
+    `port_interfaces` resolves (`device`, `port`) to the interface ids used by
+    VN endpoints (`endpoint_interface_id`) and CT apply (`ct_interface_id`); it
+    also takes `port_tags` / `system_tags` (+ `tag_match`) to select ports by tag."""
     if not blueprint_id:
         return _err("get_topology", f"scope '{scope}' requires `blueprint_id`.")
     if scope == "switch_properties":
@@ -162,9 +179,12 @@ def get_topology(scope: str, blueprint_id: str = None, switch_id: str = None,
         return systems.get_generic_system_on_port(blueprint_id, switch_id, switch_if)
     if scope == "ports":
         return ports.list_ports(blueprint_id, device, port)
+    if scope == "port_interfaces":
+        return ports.resolve_port_interfaces(
+            blueprint_id, device, port, port_tags, system_tags, tag_match)
     return _err("get_topology", f"unknown scope '{scope}'",
                 ["switch_properties", "switch_uplinks", "link_ips", "switch_loopbacks",
-                 "generic_systems", "generic_system_port", "ports"])
+                 "generic_systems", "generic_system_port", "ports", "port_interfaces"])
 
 
 def get_cabling(scope: str = "cabling_matrix", blueprint_id: str = None,
@@ -184,7 +204,10 @@ def get_network(scope: str, blueprint_id: str, vn_id: str = None) -> "list | dic
     """Virtual networks / zones (read-only). `scope`:
       virtual_networks | virtual_network | redundancy_groups |
       connectivity_templates | security_zones
-    `virtual_network` requires `vn_id`."""
+    `virtual_network` requires `vn_id` (node id) and also returns its
+    `ct_id`/`connectivity_templates` and each endpoint's `system`/`port`.
+    `connectivity_templates` lists blueprint CTs (source=blueprint, with their
+    VN) then design primitives."""
     if scope == "virtual_networks":
         return networks.list_virtual_networks(blueprint_id)
     if scope == "virtual_network":
@@ -283,37 +306,95 @@ def manage_revisions(scope: str, blueprint_id: str, revision_id: str = None,
 def configure_network(scope: str, action: str, blueprint_id: str,
                        params: dict = None) -> dict:
     """Virtual networks / zones / connectivity templates (writes). `scope`+`action`:
-      virtual_network + create       : params={label, vn_type, vn_id,
-                                        security_zone_id, ipv4_subnet, ipv4_gateway}
+      virtual_network + create       : params={label, vn_type, vn_id (VNI),
+                                        security_zone_id, ipv4_subnet, ipv4_gateway,
+                                        ipv4_enabled, virtual_gateway_ipv4_enabled,
+                                        bound_to (leaf ids/labels or
+                                        {system_id, vlan_id}; ESI members are mapped
+                                        to their redundancy group),
+                                        bound_to_tags (+ tag_match 'all'|'any', vlan_id):
+                                        bind every switch carrying the tag(s),
+                                        create_connectivity_template, ct_tagging}
+                                       The result has `applied` (stored values) and
+                                       `warnings` if a field was not applied.
+                                       Unsupported params raise an error.
+                                       If create_connectivity_template is omitted the
+                                       tool returns status 'question_required' with the
+                                       question to ask the user (no VN is created;
+                                       it is NOT an error): "Do you want to create
+                                       a Connectivity Template associated to this
+                                       Virtual Network ?", then "Tagged or Untagged ?"
+                                       -> ct_tagging='tagged'|'untagged'|'both'.
       virtual_network + update       : params={vn_id, bound_to, vni_id,
-                                        ipv4_gateway, ipv4_subnet, label}
+                                        ipv4_gateway, ipv4_subnet, label,
+                                        ipv4_enabled, virtual_gateway_ipv4_enabled,
+                                        bound_to_tags, tag_match, vlan_id}
       virtual_network + delete       : params={vn_id}
-      connectivity_template + apply  : params={ct_id, interface_ids}
+      connectivity_template + apply  : params={ct_id | vn_id (VN node id), and
+                                        interface_ids | ports=[{system, port}] |
+                                        port_tags (ports carrying the tag(s)) and/or
+                                        system_tags (all ports of tagged switches;
+                                        both = intersection), tag_match}
+                                       (see get_topology scope=port_interfaces)
       vn_dci + enable                : params={vn_id, enable_rt2, enable_rt5}
       security_zone + create         : params={label, vrf_name, vni_id, sz_type}
       sz_dci + enable                : params={sz_id, enable_rt5, enable_irt}
     """
     p = dict(params or {})
     key = (scope, action)
+    allowed = {
+        ("virtual_network", "create"): [
+            "label", "vn_type", "vn_id", "security_zone_id", "ipv4_subnet", "ipv4_gateway",
+            "ipv4_enabled", "virtual_gateway_ipv4_enabled", "create_connectivity_template",
+            "ct_tagging", "bound_to", "bound_to_tags", "tag_match", "vlan_id"],
+        ("virtual_network", "update"): [
+            "vn_id", "bound_to", "vni_id", "ipv4_gateway", "ipv4_subnet", "label",
+            "ipv4_enabled", "virtual_gateway_ipv4_enabled", "bound_to_tags", "tag_match",
+            "vlan_id"],
+        ("virtual_network", "delete"): ["vn_id"],
+        ("connectivity_template", "apply"): [
+            "ct_id", "vn_id", "interface_ids", "ports", "port_tags", "system_tags", "tag_match"],
+        ("vn_dci", "enable"): ["vn_id", "enable_rt2", "enable_rt5"],
+        ("security_zone", "create"): ["label", "vrf_name", "vni_id", "sz_type"],
+        ("sz_dci", "enable"): ["sz_id", "enable_rt5", "enable_irt"],
+    }
+    if key in allowed:
+        if "virtual_gateway_ipv4" in p and "ipv4_gateway" in allowed[key]:
+            p.setdefault("ipv4_gateway", p.pop("virtual_gateway_ipv4"))
+        bad = _unsupported_params("configure_network", f"{scope}/{action}", p, allowed[key])
+        if bad:
+            return bad
     if key == ("virtual_network", "create"):
         return networks.create_virtual_network(
             blueprint_id, label=p.get("label"), vn_type=p.get("vn_type"),
             vn_id=p.get("vn_id"), security_zone_id=p.get("security_zone_id"),
-            ipv4_subnet=p.get("ipv4_subnet"), ipv4_gateway=p.get("ipv4_gateway"))
+            ipv4_subnet=p.get("ipv4_subnet"), ipv4_gateway=p.get("ipv4_gateway"),
+            ipv4_enabled=p.get("ipv4_enabled"),
+            virtual_gateway_ipv4_enabled=p.get("virtual_gateway_ipv4_enabled"),
+            create_connectivity_template=p.get("create_connectivity_template"),
+            ct_tagging=p.get("ct_tagging"), bound_to=p.get("bound_to"),
+            bound_to_tags=p.get("bound_to_tags"), tag_match=p.get("tag_match", "all"),
+            vlan_id=p.get("vlan_id"))
     if key == ("virtual_network", "update"):
         if not p.get("vn_id"):
             return _err("configure_network", "virtual_network/update requires params.vn_id")
         return networks.update_virtual_network(
             blueprint_id, p["vn_id"], bound_to=p.get("bound_to"),
             vni_id=p.get("vni_id"), ipv4_gateway=p.get("ipv4_gateway"),
-            ipv4_subnet=p.get("ipv4_subnet"), label=p.get("label"))
+            ipv4_subnet=p.get("ipv4_subnet"), label=p.get("label"),
+            ipv4_enabled=p.get("ipv4_enabled"),
+            virtual_gateway_ipv4_enabled=p.get("virtual_gateway_ipv4_enabled"),
+            bound_to_tags=p.get("bound_to_tags"), tag_match=p.get("tag_match", "all"),
+            vlan_id=p.get("vlan_id"))
     if key == ("virtual_network", "delete"):
         if not p.get("vn_id"):
             return _err("configure_network", "virtual_network/delete requires params.vn_id")
         return networks.delete_virtual_network(blueprint_id, p["vn_id"])
     if key == ("connectivity_template", "apply"):
         return networks.apply_ct_to_interfaces(
-            blueprint_id, ct_id=p.get("ct_id"), interface_ids=p.get("interface_ids"))
+            blueprint_id, ct_id=p.get("ct_id"), interface_ids=p.get("interface_ids"),
+            ports=p.get("ports"), vn_id=p.get("vn_id"), port_tags=p.get("port_tags"),
+            system_tags=p.get("system_tags"), tag_match=p.get("tag_match", "all"))
     if key == ("vn_dci", "enable"):
         return networks.enable_vn_dci(
             blueprint_id=blueprint_id, vn_id=p.get("vn_id"),
@@ -342,10 +423,31 @@ def configure_fabric(scope: str, action: str, blueprint_id: str,
                                 vn_type, security_zone_id, vni, l2_vni,
                                 ipv4_subnet, virtual_gateway_ipv4, dhcp_relay,
                                 instantiate_port, gs_label, commit,
-                                commit_confirmed}
+                                commit_confirmed, vn_id, reuse_existing}
+                                EXISTING VN (2nd port / other leaf): pass `vn_id`
+                                (VN node id, label or VNI; `vlan_id` then optional)
+                                or `reuse_existing=true`; the VN is not re-created,
+                                only bound to the leaf if needed and the port is
+                                added. If a VN already matches label/VNI/VLAN and
+                                neither is set, an explicit error is returned.
+    Unsupported params raise an error.
     """
     p = dict(params or {})
     key = (scope, action)
+    allowed = {
+        ("generic_system", "create"): [
+            "label", "links", "port_speed", "lag_mode", "asn", "loopback_ip", "hostname"],
+        ("vlan", "prepare"): ["leaf", "port"],
+        ("vlan", "apply"): [
+            "leaf", "vlan_id", "port", "tagging", "label", "vn_type", "security_zone_id",
+            "vni", "l2_vni", "ipv4_subnet", "virtual_gateway_ipv4", "dhcp_relay",
+            "instantiate_port", "gs_label", "commit", "commit_confirmed", "vn_id",
+            "reuse_existing"],
+    }
+    if key in allowed:
+        bad = _unsupported_params("configure_fabric", f"{scope}/{action}", p, allowed[key])
+        if bad:
+            return bad
     if key == ("generic_system", "create"):
         return systems.create_generic_system(
             blueprint_id=blueprint_id, label=p.get("label"), links=p.get("links"),
@@ -363,10 +465,82 @@ def configure_fabric(scope: str, action: str, blueprint_id: str,
             dhcp_relay=p.get("dhcp_relay", False),
             instantiate_port=p.get("instantiate_port", True),
             gs_label=p.get("gs_label"), commit=p.get("commit", False),
-            commit_confirmed=p.get("commit_confirmed", False))
+            commit_confirmed=p.get("commit_confirmed", False),
+            vn_id=p.get("vn_id"), reuse_existing=p.get("reuse_existing", False))
     return _err("configure_fabric", f"unknown scope/action '{scope}'/'{action}'", [
         "generic_system+create", "vlan+prepare", "vlan+apply",
     ])
+
+
+def get_tags(scope: str, blueprint_id: str = None, tags: list = None, node: str = None,
+             node_type: str = None, tag_match: str = "all") -> "list | dict":
+    """Tags (read-only). `scope`:
+      design  : tag catalog of the design
+      list    : tags of `blueprint_id`
+      tagged  : nodes of `blueprint_id` carrying `tags` (`tag_match` 'all'|'any',
+                optional `node_type` system|interface|virtual_network|
+                security_zone...); interfaces come with their system/port
+      node    : tags of one `node` (id, or label of a system/VN/routing zone)"""
+    if scope == "design":
+        return tags_tools.list_tags(None)
+    if scope in ("list", "tagged", "node") and not blueprint_id:
+        return _err("get_tags", f"scope '{scope}' requires `blueprint_id`.")
+    if scope == "list":
+        return tags_tools.list_tags(blueprint_id)
+    if scope == "tagged":
+        return tags_tools.find_tagged_nodes(blueprint_id, tags, node_type, tag_match)
+    if scope == "node":
+        return tags_tools.get_node_tags(blueprint_id, node)
+    return _err("get_tags", f"unknown scope '{scope}'", ["design", "list", "tagged", "node"])
+
+
+def configure_tags(scope: str, action: str, blueprint_id: str = None,
+                   params: dict = None) -> dict:
+    """Tags (writes). `scope`+`action`:
+      tag + create        : params={label, description}
+      tag + update        : params={tag_id, label, description}
+      tag + delete        : params={tag_id}
+      assignment + add    : params={targets, tags, create_missing}
+      assignment + remove : params={targets, tags}
+    `tag`: blueprint tags when `blueprint_id` is given, design catalog otherwise.
+    `targets`: node ids, labels (system / VN / routing zone) or
+    {"system": "leaf1", "port": "ge-0/0/3"} for a port. Unknown tags are refused
+    on `assignment+add` unless create_missing=true (assignments need `blueprint_id`).
+    Unsupported params raise an error."""
+    p = dict(params or {})
+    key = (scope, action)
+    allowed = {
+        ("tag", "create"): ["label", "description"],
+        ("tag", "update"): ["tag_id", "label", "description"],
+        ("tag", "delete"): ["tag_id"],
+        ("assignment", "add"): ["targets", "tags", "create_missing"],
+        ("assignment", "remove"): ["targets", "tags"],
+    }
+    if key not in allowed:
+        return _err("configure_tags", f"unknown scope/action '{scope}'/'{action}'",
+                    ["tag+create", "tag+update", "tag+delete", "assignment+add", "assignment+remove"])
+    bad = _unsupported_params("configure_tags", f"{scope}/{action}", p, allowed[key])
+    if bad:
+        return bad
+    if scope == "assignment":
+        if not blueprint_id:
+            return _err("configure_tags", "assignment requires `blueprint_id`.")
+        if not p.get("targets") or not p.get("tags"):
+            return _err("configure_tags", "assignment requires params.targets and params.tags.")
+        if action == "add":
+            return tags_tools.set_node_tags(
+                blueprint_id, p["targets"], add=p["tags"],
+                create_missing=p.get("create_missing", False))
+        return tags_tools.set_node_tags(blueprint_id, p["targets"], remove=p["tags"])
+    if action == "create":
+        if not p.get("label"):
+            return _err("configure_tags", "tag/create requires params.label.")
+        return tags_tools.create_tag(p["label"], p.get("description", ""), blueprint_id)
+    if not p.get("tag_id"):
+        return _err("configure_tags", f"tag/{action} requires params.tag_id.")
+    if action == "update":
+        return tags_tools.update_tag(p["tag_id"], p.get("label"), p.get("description"), blueprint_id)
+    return tags_tools.delete_tag(p["tag_id"], blueprint_id)
 
 
 # Ordered list of the flat dispatchers to register.
@@ -374,12 +548,13 @@ _DISPATCHERS: "list[Callable]" = [
     list_catalog, get_blueprint, get_topology, get_cabling, get_network,
     get_system, get_telemetry, locate,
     configure_blueprint, manage_revisions, configure_network, configure_fabric,
+    get_tags, configure_tags,
 ]
 
 
 def install_flat_toolset(mcp: Any) -> dict:
-    """When ``APSTRA_FLAT_TOOLSET`` is truthy: register the 12 flat dispatchers
-    and de-advertise the 61 legacy atomic tools. No-op otherwise (default OFF).
+    """When ``APSTRA_FLAT_TOOLSET`` is truthy: register the 14 flat dispatchers
+    and de-advertise the 69 legacy atomic tools. No-op otherwise (default OFF).
 
     Never raises (fail-open): on any error the server is left advertising its
     full, unmodified tool set."""

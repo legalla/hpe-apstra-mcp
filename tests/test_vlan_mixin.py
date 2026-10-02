@@ -129,3 +129,130 @@ def test_dhcp_relay_flag_reflected_in_payload():
     client.add_vlan_to_port("bp1", "leaf1", 10, dhcp_relay=True, security_zone_id="Tenant1")
 
     assert client.create_virtual_network_calls[0]["dhcp_service"] == "dhcpServiceEnabled"
+
+
+# ── Reusing an existing VN ─────────────────────────────────────────────
+
+class _ReuseClient(_StubClient):
+    """Adds a VN list, a resolvable port and CT/PATCH recording."""
+
+    def __init__(self, vns, cts=None, **kw):
+        super().__init__(**kw)
+        self._vns = {v["id"]: v for v in vns}
+        self._cts = [{"id": "ct-1", "label": "vn_110", "tagging": ["vlan_tagged"]}] if cts is None else cts
+        self.patches = []
+        self.applied = []
+        self.created_cts = []
+
+    def _qe(self, blueprint_id, query):
+        if "if_name='ge-0/0/3'" in query:
+            return [{"i": {"id": "sw-if"}}]
+        return super()._qe(blueprint_id, query)
+
+    def resolve_port_interfaces(self, blueprint_id, device=None, port=None):
+        return [{"endpoint_interface_id": "gen-if", "ct_interface_id": "ct-if"}]
+
+    def get_vn_connectivity_templates(self, blueprint_id, vn_id):
+        return self._cts
+
+    def create_vn_connectivity_template(self, blueprint_id, vn_id, label, vn_type, tag_type):
+        self.created_cts.append(tag_type)
+        return {"id": "ct-new", "label": "new", "tagging": [tag_type]}
+
+    def apply_ct_to_interfaces(self, blueprint_id, ct_id, interface_ids):
+        self.applied.append((ct_id, interface_ids))
+        return {}
+
+    def _get(self, path, params=None):
+        if path.endswith("/virtual-networks"):
+            return {"virtual_networks": self._vns}
+        if "/virtual-networks/" in path:
+            return self._vns[path.rsplit("/", 1)[1]]
+        return super()._get(path, params)
+
+    def _patch(self, path, body):
+        self.patches.append((path, body))
+        return {}
+
+
+_VN = {"id": "vn1", "label": "vn_110", "vn_type": "vxlan", "vn_id": "10110",
+       "bound_to": [{"system_id": "rg-1", "vlan_id": 110, "access_switch_node_ids": []}],
+       "endpoints": [{"interface_id": "other-if", "tag_type": "vlan_tagged"}]}
+
+
+def test_existing_vn_without_reuse_flag_raises_explicit_error():
+    client = _ReuseClient([_VN], bound_id="rg-1", zones=_ZONES)
+
+    with pytest.raises(ValueError, match="reuse_existing"):
+        client.add_vlan_to_port("bp1", "leaf1", 110, label="vn_110",
+                                security_zone_id="Tenant1")
+
+    assert client.create_virtual_network_calls == []
+
+
+def test_vn_id_applies_the_vn_ct_to_the_port_without_creating():
+    client = _ReuseClient([_VN], bound_id="rg-1", zones=_ZONES)
+
+    result = client.add_vlan_to_port(
+        "bp1", "leaf1", port="ge-0/0/3", tagging="tagged", vn_id="vn_110")
+
+    assert client.create_virtual_network_calls == []
+    assert result["reused_existing_vn"] is True
+    assert result["ct_id"] == "ct-1"
+    assert client.applied == [("ct-1", ["ct-if"])]
+    assert client.patches == []  # already bound to the ESI pair: nothing to bind
+
+
+def test_vn_without_ct_gets_one_created_before_apply():
+    client = _ReuseClient([_VN], cts=[], bound_id="rg-1", zones=_ZONES)
+
+    client.add_vlan_to_port("bp1", "leaf1", port="ge-0/0/3", tagging="tagged", vn_id="vn1")
+
+    assert client.created_cts == ["vlan_tagged"]
+    assert client.applied == [("ct-new", ["ct-if"])]
+
+
+def test_reuse_existing_binds_vn_to_a_new_leaf():
+    client = _ReuseClient([_VN], bound_id="leaf-3", zones=_ZONES)
+
+    client.add_vlan_to_port("bp1", "leaf3", label="vn_110", reuse_existing=True)
+
+    path, body = client.patches[0]
+    assert {b["system_id"] for b in body["bound_to"]} == {"rg-1", "leaf-3"}
+    assert body["bound_to"][-1]["vlan_id"] == 110  # taken from the existing binding
+
+
+def test_assigning_twice_is_idempotent():
+    vn = {**_VN, "endpoints": [{"interface_id": "gen-if", "tag_type": "vlan_tagged"}]}
+    client = _ReuseClient([vn], bound_id="rg-1", zones=_ZONES)
+
+    result = client.add_vlan_to_port(
+        "bp1", "leaf1", port="ge-0/0/3", tagging="tagged", vn_id="vn1")
+
+    assert client.applied == []
+    assert any(s.get("status") == "already_assigned" for s in result["steps"])
+
+
+def test_unknown_vn_id_raises():
+    client = _ReuseClient([_VN], bound_id="rg-1", zones=_ZONES)
+
+    with pytest.raises(ValueError, match="No VN matches"):
+        client.add_vlan_to_port("bp1", "leaf1", vn_id="nope")
+
+
+def test_vlan_id_required_without_vn_id():
+    client = _ReuseClient([], bound_id="rg-1", zones=_ZONES)
+
+    with pytest.raises(ValueError, match="vlan_id"):
+        client.add_vlan_to_port("bp1", "leaf1")
+
+
+def test_create_with_port_and_tagging_requests_ct_creation():
+    client = _ReuseClient([{"id": "vn-123", "endpoints": []}], bound_id="leaf-1", zones=_ZONES)
+
+    client.add_vlan_to_port("bp1", "leaf1", 10, port="ge-0/0/3", tagging="untagged")
+
+    payload = client.create_virtual_network_calls[0]
+    assert payload["create_policy_untagged"] is True
+    assert payload["create_policy_tagged"] is False
+    assert "endpoints" not in payload

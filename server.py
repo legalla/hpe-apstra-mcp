@@ -21,6 +21,7 @@ from tools import (  # noqa: F401
     vlan,
     ports,
     catalog,
+    tags,
 )
 import prompts  # noqa: F401
 

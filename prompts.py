@@ -34,7 +34,10 @@ def create_virtual_network_guide(
         f"2. List the existing VNs with list_virtual_networks('{blueprint_id}') to "
         "avoid VNI/subnet duplicates.\n"
         "3. Ask me for the missing parameters (vlan/vxlan type, VNI, IPv4 subnet, "
-        "gateway) then create the VN with create_virtual_network.\n"
+        "gateway). If I did not mention it, ask me \"Do you want to create a "
+        "Connectivity Template associated to this Virtual Network ?\" and, if yes, "
+        "\"Tagged or Untagged ?\" — then create the VN with create_virtual_network "
+        "(create_connectivity_template / ct_tagging).\n"
         f"4. Check with check_blueprint_commit('{blueprint_id}'), show me the diff, "
         "then propose to commit with commit_blueprint after my validation."
     )

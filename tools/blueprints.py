@@ -39,8 +39,13 @@ def get_blueprint_logical_diff(blueprint_id: str) -> dict:
     return _client().get_blueprint_logical_diff(blueprint_id)
 
 @mcp.tool()
-def get_blueprint_nodes(blueprint_id: str, node_type: str = None) -> dict:
-    """Blueprint nodes."""
+def get_blueprint_nodes(
+    blueprint_id: str, node_type: str = None, tags: list = None, tag_match: str = "all",
+) -> dict:
+    """Blueprint nodes. With `tags`, only the nodes carrying the tag(s) are
+    returned (`tag_match` 'all'|'any'; `node_type` filters their type)."""
+    if tags:
+        return _client().find_tagged(blueprint_id, tags, node_type, tag_match)
     return _client().get_blueprint_nodes(blueprint_id, node_type)
 
 @mcp.tool()

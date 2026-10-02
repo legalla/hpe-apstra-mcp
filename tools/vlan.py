@@ -28,7 +28,7 @@ def prepare_vlan(blueprint_id: str, leaf: str, port: str = None) -> dict:
 def add_vlan_to_port(
     blueprint_id: str,
     leaf: str,
-    vlan_id: int,
+    vlan_id: int = None,
     port: str = None,
     tagging: str = None,
     label: str = None,
@@ -43,14 +43,22 @@ def add_vlan_to_port(
     gs_label: str = None,
     commit: bool = False,
     commit_confirmed: bool = False,
+    vn_id: str = None,
+    reuse_existing: bool = False,
 ) -> dict:
     """Create a VLAN (Virtual Network) on a leaf and assign it to a port.
 
+    EXISTING VN: to assign a VN that already exists (e.g. to a 2nd port/leaf)
+    pass `vn_id` (VN node id, label or VNI; `vlan_id` then optional) or
+    `reuse_existing=True` (reuse the VN matching label/VNI/VLAN). The VN is not
+    re-created: it is bound to the leaf if needed and attached to the port
+    through its Connectivity Template.
+    If a VN already matches and neither is set, an explicit error is raised.
+
     Creates a Virtual Network local to the leaf (no impact on the other leafs).
-    When a 'port' and a 'tagging' mode are provided, Apstra AUTO-CREATES the
-    Connectivity Template that connects the port to the VLAN: this server NEVER
-    creates a CT manually. The commit (push to the device) only happens if
-    commit=True.
+    When a 'port' and a 'tagging' mode are provided, the VN's Connectivity
+    Template (created if missing) is applied to the port. The commit (push to
+    the device) only happens if commit=True.
 
     MANDATORY WORKFLOW:
       STEP 0 — First call prepare_vlan(blueprint_id, leaf, port) to know the
@@ -105,4 +113,5 @@ def add_vlan_to_port(
         security_zone_id=security_zone_id, vni=vni, l2_vni=l2_vni,
         ipv4_subnet=ipv4_subnet, virtual_gateway_ipv4=virtual_gateway_ipv4,
         dhcp_relay=dhcp_relay, instantiate_port=instantiate_port,
-        gs_label=gs_label, commit=commit, commit_confirmed=commit_confirmed)
+        gs_label=gs_label, commit=commit, commit_confirmed=commit_confirmed,
+        vn_id=vn_id, reuse_existing=reuse_existing)

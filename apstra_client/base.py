@@ -27,6 +27,13 @@ class BaseMixin:
         """Filter each dict of a list to keep only the specified keys."""
         return [{k: item[k] for k in keys if k in item} for item in items]
 
+    @staticmethod
+    def _dict_values(raw: Any) -> list[dict]:
+        """Apstra returns collections either as a list or as an id-indexed dict."""
+        if isinstance(raw, dict):
+            raw = raw.values()
+        return [v for v in (raw or []) if isinstance(v, dict)]
+
     def __init__(self, host: str, username: str, password: str, verify_ssl: bool = False):
         self.base_url   = f"https://{host}/api"
         self.username   = username
@@ -70,29 +77,38 @@ class BaseMixin:
                 response=r,
             )
 
+    @staticmethod
+    def _json_or_empty(r: requests.Response) -> Any:
+        """Some Apstra endpoints return 200/204 with an empty body on success
+        (e.g. certain PATCH calls) -- .json() would raise on that."""
+        try:
+            return r.json()
+        except ValueError:
+            return {}
+
     def _get(self, path: str, params: dict | None = None) -> Any:
         self._ensure_logged_in()
         r = self.session.get(f"{self.base_url}{path}", params=params, verify=self.verify_ssl)
         self._raise_for_status(r)
-        return r.json()
+        return self._json_or_empty(r)
 
     def _post(self, path: str, body: dict) -> Any:
         self._ensure_logged_in()
         r = self.session.post(f"{self.base_url}{path}", json=body, verify=self.verify_ssl)
         self._raise_for_status(r)
-        return r.json()
+        return self._json_or_empty(r)
 
     def _patch(self, path: str, body: dict) -> Any:
         self._ensure_logged_in()
         r = self.session.patch(f"{self.base_url}{path}", json=body, verify=self.verify_ssl)
         self._raise_for_status(r)
-        return r.json()
+        return self._json_or_empty(r)
 
     def _put(self, path: str, body: dict) -> Any:
         self._ensure_logged_in()
         r = self.session.put(f"{self.base_url}{path}", json=body, verify=self.verify_ssl)
         self._raise_for_status(r)
-        return r.json()
+        return self._json_or_empty(r)
 
     def _delete(self, path: str) -> None:
         self._ensure_logged_in()

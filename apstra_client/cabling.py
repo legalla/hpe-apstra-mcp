@@ -237,6 +237,11 @@ class CablingMixin:
             rack_map = self._system_rack_map(bp) if rack_q else {}
             data = self._get(f"/blueprints/{bp}/cabling-map")
             links = data.get("links", []) if isinstance(data, dict) else []
+            try:
+                port_ids = {(r["switch"], r["port"]): r
+                            for r in self.resolve_port_interfaces(bp)}
+            except (requests.exceptions.RequestException, ValueError, KeyError, TypeError):
+                port_ids = {}
             for link in links:
                 endpoints = link.get("endpoints", [])
                 if len(endpoints) != 2:
@@ -267,6 +272,15 @@ class CablingMixin:
                     "b_system": b["system"], "b_role": b["role"],
                     "b_interface": b["interface"], "b_ip": b["ip"], "b_state": b["state"],
                 })
+                ids = port_ids.get((a["system"], a["interface"]))
+                if category == "endpoint-leaf" and ids:
+                    # The cabling map has no generic-side port name: expose graph ids instead.
+                    rows[-1].update({
+                        "a_interface_id": ids["switch_interface_id"],
+                        "b_interface_id": ids["generic_interface_id"],
+                        "endpoint_interface_id": ids["endpoint_interface_id"],
+                        "ct_interface_id": ids["ct_interface_id"],
+                    })
 
         rows.sort(key=lambda r: (r["category"], r["a_system"] or "", r["a_interface"] or ""))
         by_category: dict[str, int] = {}

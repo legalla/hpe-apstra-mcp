@@ -22,7 +22,7 @@ apstra_client/   ApstraClient REST client (mixins by domain: blueprints,
                  networks, systems, topology, endpoints, cabling, locate,
                  revisions, telemetry, vlan, ports, catalog)
 core.py          FastMCP instance, Bearer auth, write-guard, _client()
-tools/           61 @mcp.tool() functions, one module per domain
+tools/           69 @mcp.tool() functions, one module per domain
 dispatch/        Optional flat dispatcher toolset (see below)
 prompts.py       6 guided @mcp.prompt() templates
 server.py        Entry point (imports core + tools + prompts, run())
@@ -56,7 +56,7 @@ pytest
 | `APSTRA_TOKENS_FILE`  | Named tokens file                            | `/app/secrets/.tokens` |
 | `APSTRA_TRUST_FORWARDED_FOR` | Trust `X-Forwarded-For` (proxy)       | `false` |
 | `APSTRA_WRITE_ENABLED` | Allow mutating tools (create/update/delete, commit, rollback, revert) | `false` |
-| `APSTRA_FLAT_TOOLSET`  | Collapse the 61 atomic tools into 12 scope/action dispatchers | `false` |
+| `APSTRA_FLAT_TOOLSET`  | Collapse the 69 atomic tools into 14 scope/action dispatchers | `false` |
 
 ---
 
@@ -234,13 +234,13 @@ Claude Desktop config:
 
 ## Flat dispatcher toolset (tool count optimization)
 
-61 atomic tools is a lot for an LLM's tool-selection context. Setting
-`APSTRA_FLAT_TOOLSET=true` (env or `.env`) collapses them into **12 scope/action
+69 atomic tools is a lot for an LLM's tool-selection context. Setting
+`APSTRA_FLAT_TOOLSET=true` (env or `.env`) collapses them into **14 scope/action
 dispatchers** (`dispatch/flat_tools.py`): each dispatcher takes a `scope` (and,
 for writes, an `action`) picking which underlying legacy function to call —
 zero change to `apstra_client/` business logic, and mutating scopes still go
 through `@_require_write` exactly like before. Disabled by default
-(`false`): the 61 legacy tools stay advertised unchanged. Toggling the flag
+(`false`): the 69 legacy tools stay advertised unchanged. Toggling the flag
 only needs `docker compose up -d` (no rebuild) plus reconnecting the MCP
 client (it caches the tool list from the previous session).
 
@@ -258,10 +258,12 @@ client (it caches the tool list from the previous session).
 | `manage_revisions`    | revisions.py (3)             | `list`, `rollback` ✍️, `revert` ✍️ |
 | `configure_network`   | network writes (7) ✍️         | `virtual_network`+`create`/`update`/`delete`, `security_zone`+`create`, … |
 | `configure_fabric`    | generic_system + vlan (3) ✍️  | `generic_system`+`create`, `vlan`+`prepare`/`apply` |
+| `get_tags`            | tags reads (3)               | `design`, `list`, `tagged`, `node` |
+| `configure_tags`      | tags writes (4) ✍️            | `tag`+`create`/`update`/`delete`, `assignment`+`add`/`remove` |
 
 ---
 
-## Available tools (61 tools, or 12 dispatchers with `APSTRA_FLAT_TOOLSET=true`)
+## Available tools (69 tools, or 14 dispatchers with `APSTRA_FLAT_TOOLSET=true`)
 
 > ✍️ marks a write tool: blocked with `PermissionError` unless `APSTRA_WRITE_ENABLED=true`
 > (see [Security: read-only mode by default](#security-read-only-mode-by-default)).
@@ -288,12 +290,12 @@ client (it caches the tool list from the previous session).
 ### Virtual Networks
 - `list_virtual_networks`          — VLANs/VXLANs of a blueprint
 - `get_virtual_network`            — Details of a virtual network
-- `create_virtual_network`         — ✍️ Create a virtual network
+- `create_virtual_network`         — ✍️ Create a virtual network. Asks "Do you want to create a Connectivity Template associated to this Virtual Network ?" (then "Tagged or Untagged ?") when not specified — maps to Apstra's `create_policy_tagged` / `create_policy_untagged`
 - `update_virtual_network`         — ✍️ Update a virtual network
 - `delete_virtual_network`         — ✍️ Delete a virtual network
 - `list_redundancy_groups`         — ESI redundancy groups
 - `list_connectivity_templates`    — Connectivity templates (CT)
-- `apply_ct_to_interfaces`         — ✍️ Apply a CT to interfaces
+- `apply_ct_to_interfaces`         — ✍️ Apply a CT to interfaces (by `interface_ids`, `ports=[{system, port}]`, or `vn_id` instead of `ct_id`)
 - `enable_vn_dci`                  — ✍️ Enable DCI (RT2 and/or RT5) on a VN
 
 ### Security / Routing Zones
@@ -319,6 +321,7 @@ client (it caches the tool list from the previous session).
 - `get_fabric_matrix`              — Hierarchical cabling matrix endpoint→leaf→spine
 - `cabling_matrix`                 — Cabling matrix via /cabling-map (A→B links)
 - `list_ports`                     — Ports of a device (status, LACP, CT)
+- `resolve_port_interfaces`        — (leaf, port) -> interface ids for CT apply / VN endpoints
 
 ### Health & BGP
 - `get_bgp_status`                 — Real-time state of all BGP peerings
@@ -329,9 +332,21 @@ client (it caches the tool list from the previous session).
 - `rollback_blueprint`             — ✍️ Roll back to a previous revision
 - `revert_staging`                 — ✍️ Discard uncommitted staging changes
 
+### Tags
+- `list_tags`                      — Tags of a blueprint (or of the design catalog)
+- `find_tagged_nodes`              — Nodes carrying tag(s) (`match` all/any, `node_type`)
+- `get_node_tags`                  — Tags of one node
+- `create_tag` / `update_tag` / `delete_tag` — ✍️ Manage tags (blueprint, or design if no `blueprint_id`)
+- `set_node_tags`                  — ✍️ Add/remove tags on systems, ports, VNs, routing zones
+
+Tags also filter other tools: `create_virtual_network` / `update_virtual_network`
+(`bound_to_tags`: bind only the switches carrying the tag), `apply_ct_to_interfaces`
+(`port_tags` / `system_tags`: apply only on tagged ports / ports of tagged switches),
+`resolve_port_interfaces` and `get_blueprint_nodes` (`tags`).
+
 ### VLAN provisioning workflow
 - `prepare_vlan`                   — Pre-flight questionnaire before adding a VLAN
-- `add_vlan_to_port`               — ✍️ Create a VLAN on a leaf and assign it to a port
+- `add_vlan_to_port`               — ✍️ Create a VLAN on a leaf and assign it to a port; `vn_id` / `reuse_existing=true` assign an EXISTING VN (no re-creation)
 
 ### Resources
 - `list_asn_pools`                 — ASN pools

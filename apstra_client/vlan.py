@@ -2,6 +2,7 @@
 
 import ipaddress
 import requests
+import time
 from typing import Any, Optional
 
 
@@ -213,7 +214,7 @@ class VlanMixin:
         self,
         blueprint_id: str,
         leaf: str,
-        vlan_id: int,
+        vlan_id: int | None = None,
         port: str | None = None,
         tagging: str | None = None,
         label: str | None = None,
@@ -228,15 +229,24 @@ class VlanMixin:
         gs_label: str | None = None,
         commit: bool = False,
         commit_confirmed: bool = False,
+        vn_id: str | None = None,
+        reuse_existing: bool = False,
     ) -> dict:
         """Create a VLAN (Virtual Network) on a leaf and assign it to a port.
 
+        EXISTING VN: pass 'vn_id' (VN node id, label or VNI) to assign an
+        already existing VN to the port without re-creating it; or
+        'reuse_existing=True' to reuse the VN matching 'label' / VNI / VLAN on
+        this leaf if there is one. The VN is bound to the leaf if needed and
+        attached to the port through its Connectivity Template. Without either
+        flag, a matching VN raises an explicit error (instead of a controller 422).
+
         Creates a Virtual Network local to the indicated leaf (no impact on the
         other leafs). If 'port' is provided WITH 'tagging' ('tagged' or
-        'untagged'), the VN is assigned to the port via Apstra's native
-        mechanism: the Connectivity Template is AUTO-CREATED by Apstra (the
-        server never creates a CT manually). The commit (push to the device)
-        only happens if commit=True.
+        'untagged'), the VN is attached to the port through its Connectivity
+        Template (created with the VN via Apstra's `create_policy_*`, or built
+        from Apstra's CT structure if the VN has none) applied to the port.
+        The commit (push to the device) only happens if commit=True.
 
         'tagging':
           - 'tagged'   -> the VLAN is tagged (802.1Q) on the port;
@@ -302,11 +312,34 @@ class VlanMixin:
         bound_id = self._resolve_system_id_for_bound_to(blueprint_id, leaf_id)
         esi_pair = bound_id != leaf_id
 
-        vlan_id = int(vlan_id)
+        vn_ref = vn_id
+        if vlan_id is None and not (vn_ref or (reuse_existing and label)):
+            raise ValueError(
+                "'vlan_id' is required to create a VN (or pass 'vn_id' to "
+                "assign an existing VN).")
+        vlan_id = int(vlan_id) if vlan_id is not None else None
         # Options requiring a 'vxlan' VN (L3 or L2VNI) or ESI pair.
         want_l3 = bool(ipv4_subnet) or dhcp_relay
         if l2_vni is not None or want_l3 or (esi_pair and vn_type == "vlan"):
             vn_type = "vxlan"
+
+        # Reuse an existing VN instead of re-creating it (a re-creation fails
+        # with VN_NAME_VXLAN_OVERLAPS / VLAN_ID_NOT_UNIQUE_WITHIN_SYSTEM /
+        # VNI_ALREADY_USED_IN_VXLAN).
+        cand_vni = l2_vni if l2_vni is not None else (
+            vni if vni is not None else (
+                10000 + vlan_id if vlan_id is not None else None))
+        existing = self._find_existing_vn(
+            blueprint_id, bound_id, vn_ref, reuse_existing, label,
+            vlan_id, vn_type, cand_vni)
+        if existing is not None:
+            return self._reuse_vn_on_port(
+                blueprint_id, existing, leaf_id, leaf_label, bound_id,
+                vlan_id, port, tagging, instantiate_port, gs_label,
+                commit, commit_confirmed)
+
+        if vlan_id is None:
+            raise ValueError("'vlan_id' is required: no existing VN matches to reuse.")
         vn_label = label or f"VLAN-{vlan_id}-{leaf_label}"
         payload = {
             "label": vn_label,
@@ -385,59 +418,11 @@ class VlanMixin:
             "dhcpServiceEnabled" if dhcp_relay else "dhcpServiceDisabled")
 
         steps = []
-        port_assignment = None
-        instantiation = None
-        gen_iface_id = None
-        switch_iface_id = None
-
-        # Port resolution BEFORE the VN creation: if a 'tagging' is
-        # requested, the interface of the generic system facing the port is added
-        # to the VN's 'endpoints', which makes Apstra AUTO-CREATE the Connectivity
-        # Template (the server never creates a CT manually).
-        if port:
-            ifs = self._qe(
-                blueprint_id,
-                f"node('system', id='{leaf_id}')"
-                f".out('hosted_interfaces')"
-                f".node('interface', if_name='{port}', name='i')",
-            )
-            switch_iface_id = ifs[0]["i"]["id"] if ifs else None
-            # Unused port (no interface node): instantiate it by creating
-            # a minimal generic system on it, otherwise it stays unassignable.
-            if not switch_iface_id and instantiate_port:
-                try:
-                    instantiation = self.instantiate_port(
-                        blueprint_id, leaf_id, leaf_label, port,
-                        gs_label=gs_label)
-                    switch_iface_id = instantiation.get("interface_id")
-                    steps.append({
-                        "step": "instantiate_port",
-                        "status": "applied",
-                        "port": port,
-                        "generic_system": instantiation.get("gs_label"),
-                        "reason": (
-                            "Unused port: single-port generic system "
-                            "created to make the port assignable."
-                        ),
-                    })
-                except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as exc:
-                    steps.append({
-                        "step": "instantiate_port",
-                        "status": "failed",
-                        "port": port,
-                        "reason": f"Port instantiation failed: {exc}",
-                    })
-
-            if switch_iface_id and tagging:
-                gen_iface_id = self._generic_side_interface(
-                    blueprint_id, switch_iface_id)
-                if gen_iface_id:
-                    tag_type = ("vlan_tagged" if tagging == "tagged"
-                                else "untagged")
-                    payload["endpoints"] = [{
-                        "interface_id": gen_iface_id,
-                        "tag_type": tag_type,
-                    }]
+        # A CT is only created by Apstra when asked at VN creation; endpoints
+        # alone attach nothing. Ask for it when a port + tagging are requested.
+        if port and tagging:
+            payload["create_policy_tagged"] = tagging == "tagged"
+            payload["create_policy_untagged"] = tagging == "untagged"
 
         vn = self.create_virtual_network(blueprint_id, payload)
         vn_id = vn.get("id") if isinstance(vn, dict) else None
@@ -460,98 +445,13 @@ class VlanMixin:
             },
         })
 
-        # Summary of the port assignment.
-        if port:
-            if not switch_iface_id:
-                steps.append({
-                    "step": "assign_port",
-                    "status": "skipped",
-                    "reason": (
-                        f"Interface '{port}' not found on {leaf_label}"
-                        + ("." if instantiate_port
-                           else " (instantiate_port=False).")),
-                })
-            elif not tagging:
-                # No tagging => no CT created: the user must be
-                # informed (VN created but port not connected to the VLAN).
-                port_assignment = {
-                    "port": port, "interface_id": switch_iface_id,
-                    "tagging": None, "ct_created": False,
-                    "instantiation": instantiation,
-                }
-                steps.append({
-                    "step": "assign_port",
-                    "status": "no_ct",
-                    "port": port,
-                    "reason": (
-                        "No 'tagged'/'untagged' mode chosen: NO "
-                        "Connectivity Template was created and the port is "
-                        "NOT connected to this VLAN. The VN exists alone. Retry "
-                        "with tagging='tagged' or 'untagged' to assign the "
-                        "port."
-                    ),
-                })
-            elif not gen_iface_id:
-                steps.append({
-                    "step": "assign_port",
-                    "status": "failed",
-                    "port": port,
-                    "reason": (
-                        "Interface of the generic system facing the port "
-                        "not found: CT not auto-created. Check that the port "
-                        "indeed faces a system."
-                    ),
-                })
-            else:
-                port_assignment = {
-                    "port": port, "interface_id": switch_iface_id,
-                    "tagging": tagging, "ct_created": True,
-                    "generic_interface_id": gen_iface_id,
-                    "instantiation": instantiation,
-                }
-                steps.append({
-                    "step": "assign_port",
-                    "status": "applied",
-                    "port": port,
-                    "tagging": tagging,
-                    "reason": (
-                        "VN assigned to the port as '%s'; Connectivity Template "
-                        "auto-created by Apstra." % tagging),
-                })
+        port_assignment = self._assign_vn_to_port(
+            blueprint_id, vn_id, vn_label, vn_type, leaf_id, leaf_label, port,
+            tagging, instantiate_port, gs_label, steps, just_created=True)
 
-        commit_result = None
-        commit_done = False
-        if commit and not commit_confirmed:
-            # Safety lock: a commit was requested but NOT confirmed.
-            # We DO NOT commit. The assistant MUST ask the
-            # confirmation question to the user, then call again with commit_confirmed=True.
-            steps.append({
-                "step": "commit",
-                "status": "confirmation_required",
-                "reason": (
-                    "Commit requested but not confirmed. Changes in staging, "
-                    "NOT deployed."),
-                "question_to_ask": (
-                    "The change is about to be committed — are you sure?"),
-                "if_yes": (
-                    "call add_vlan_to_port again with the same parameters + "
-                    "commit=True AND commit_confirmed=True."),
-                "if_no": (
-                    "DO NOT commit. Then ask the question: 'Do you want to "
-                    "cancel the change and trigger a revert?'. If YES -> "
-                    "call revert_staging(confirmed=True). If NO -> do "
-                    "nothing (the VN stays in staging) and provide a short summary."),
-            })
-        elif commit and commit_confirmed:
-            commit_result = self.commit_blueprint(
-                blueprint_id, description=f"Add {vn_label} on {leaf_label}")
-            commit_done = True
-            steps.append({"step": "commit", "status": "deployed"})
-        else:
-            steps.append({
-                "step": "commit", "status": "staged",
-                "reason": "commit=False: changes in staging, not deployed.",
-            })
+        commit_result, commit_done = self._commit_step(
+            blueprint_id, commit, commit_confirmed,
+            f"Add {vn_label} on {leaf_label}", steps)
 
         return {
             "blueprint_id": blueprint_id,
@@ -573,3 +473,277 @@ class VlanMixin:
             ),
         }
 
+
+    # ── Helpers shared by add_vlan_to_port (create / reuse paths) ────
+
+    def _prepare_port_for_vlan(
+        self, blueprint_id, leaf_id, leaf_label, port, instantiate_port,
+        gs_label, steps,
+    ):
+        """Return (switch_iface_id, instantiation) for a port, instantiating an
+        unused port if allowed."""
+        instantiation = None
+        ifs = self._qe(
+            blueprint_id,
+            f"node('system', id='{leaf_id}')"
+            f".out('hosted_interfaces')"
+            f".node('interface', if_name='{port}', name='i')",
+        )
+        switch_iface_id = ifs[0]["i"]["id"] if ifs else None
+        # Unused port (no interface node): instantiate it by creating
+        # a minimal generic system on it, otherwise it stays unassignable.
+        if not switch_iface_id and instantiate_port:
+            try:
+                instantiation = self.instantiate_port(
+                    blueprint_id, leaf_id, leaf_label, port, gs_label=gs_label)
+                switch_iface_id = instantiation.get("interface_id")
+                steps.append({
+                    "step": "instantiate_port",
+                    "status": "applied",
+                    "port": port,
+                    "generic_system": instantiation.get("gs_label"),
+                    "reason": (
+                        "Unused port: single-port generic system "
+                        "created to make the port assignable."
+                    ),
+                })
+            except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as exc:
+                steps.append({
+                    "step": "instantiate_port",
+                    "status": "failed",
+                    "port": port,
+                    "reason": f"Port instantiation failed: {exc}",
+                })
+        return switch_iface_id, instantiation
+
+    def _assign_vn_to_port(
+        self, blueprint_id, vn_node_id, vn_label, vn_type, leaf_id, leaf_label,
+        port, tagging, instantiate_port, gs_label, steps, just_created=False,
+    ):
+        """Attach a VN to a leaf port through its Connectivity Template (the
+        CT is created if the VN has none for this tagging). Appends an
+        `assign_port` step; returns the port_assignment dict or None."""
+        if not port:
+            return None
+        switch_iface_id, instantiation = self._prepare_port_for_vlan(
+            blueprint_id, leaf_id, leaf_label, port, instantiate_port, gs_label, steps)
+        if not switch_iface_id:
+            steps.append({
+                "step": "assign_port", "status": "skipped", "port": port,
+                "reason": (f"Interface '{port}' not found on {leaf_label}"
+                           + ("." if instantiate_port else " (instantiate_port=False)."))})
+            return None
+        if not tagging:
+            steps.append({
+                "step": "assign_port", "status": "no_ct", "port": port,
+                "reason": ("No 'tagged'/'untagged' mode chosen: the port is NOT "
+                           "connected to this VN. Retry with tagging='tagged' or "
+                           "'untagged' to assign the port.")})
+            return {"port": port, "interface_id": switch_iface_id, "tagging": None,
+                    "ct_created": False, "instantiation": instantiation}
+
+        tag_type = "vlan_tagged" if tagging == "tagged" else "untagged"
+        row = None
+        for _ in range(10 if instantiation else 1):
+            rows = self.resolve_port_interfaces(blueprint_id, device=leaf_id, port=port)
+            if rows:
+                row = rows[0]
+                break
+            time.sleep(0.5)
+        if not row:
+            steps.append({
+                "step": "assign_port", "status": "failed", "port": port,
+                "reason": ("The port does not face a generic system: no "
+                           "interface to attach the Connectivity Template to.")})
+            return None
+
+        cts = []
+        for _ in range(6 if just_created else 1):
+            cts = self.get_vn_connectivity_templates(blueprint_id, vn_node_id)
+            if any(tag_type in c["tagging"] for c in cts):
+                break
+            time.sleep(0.5)
+        ct = next((c for c in cts if tag_type in c["tagging"]), None)
+        if ct is None:
+            ct = self.create_vn_connectivity_template(
+                blueprint_id, vn_node_id, vn_label, vn_type, tag_type)
+            steps.append({
+                "step": "create_ct", "status": "applied", "ct_id": ct["id"],
+                "reason": f"VN had no {tag_type} Connectivity Template."})
+
+        vn = self._get(f"/blueprints/{blueprint_id}/virtual-networks/{vn_node_id}")
+        already = any(
+            e.get("interface_id") == row["endpoint_interface_id"]
+            and e.get("tag_type") == tag_type for e in vn.get("endpoints") or [])
+        if not already:
+            self.apply_ct_to_interfaces(blueprint_id, ct["id"], [row["ct_interface_id"]])
+        steps.append({
+            "step": "assign_port", "port": port, "tagging": tagging,
+            "status": "already_assigned" if already else "applied",
+            "ct_id": ct["id"],
+            "reason": f"VN attached to the port as '{tagging}' via CT '{ct.get('label')}'."})
+        return {"port": port, "interface_id": switch_iface_id, "tagging": tagging,
+                "ct_id": ct["id"], "ct_interface_id": row["ct_interface_id"],
+                "ct_created": True, "instantiation": instantiation}
+
+    def _commit_step(self, blueprint_id, commit, commit_confirmed, description, steps):
+        """Append the commit step (with the confirmation lock). Returns (result, done)."""
+        if commit and not commit_confirmed:
+            # Safety lock: a commit was requested but NOT confirmed.
+            # We DO NOT commit. The assistant MUST ask the
+            # confirmation question to the user, then call again with commit_confirmed=True.
+            steps.append({
+                "step": "commit",
+                "status": "confirmation_required",
+                "reason": (
+                    "Commit requested but not confirmed. Changes in staging, "
+                    "NOT deployed."),
+                "question_to_ask": (
+                    "The change is about to be committed — are you sure?"),
+                "if_yes": (
+                    "call add_vlan_to_port again with the same parameters + "
+                    "commit=True AND commit_confirmed=True."),
+                "if_no": (
+                    "DO NOT commit. Then ask the question: 'Do you want to "
+                    "cancel the change and trigger a revert?'. If YES -> "
+                    "call revert_staging(confirmed=True). If NO -> do "
+                    "nothing (the VN stays in staging) and provide a short summary."),
+            })
+            return None, False
+        if commit and commit_confirmed:
+            result = self.commit_blueprint(blueprint_id, description=description)
+            steps.append({"step": "commit", "status": "deployed"})
+            return result, True
+        steps.append({
+            "step": "commit", "status": "staged",
+            "reason": "commit=False: changes in staging, not deployed.",
+        })
+        return None, False
+
+    def _find_existing_vn(
+        self, blueprint_id, bound_id, vn_ref, reuse_existing, label,
+        vlan_id, vn_type, cand_vni,
+    ):
+        """Return the existing VN to reuse, or None to create a new one.
+
+        - `vn_ref` (node id, label or VNI) given: that VN must exist.
+        - otherwise a VN colliding on label / VNI / VLAN-on-this-system is
+          reused if `reuse_existing`, else an explicit error is raised (the
+          controller would answer 422).
+        """
+        raw = self._get(f"/blueprints/{blueprint_id}/virtual-networks")
+        vns = raw.get("virtual_networks", []) if isinstance(raw, dict) else raw
+        vns = [v for v in (vns.values() if isinstance(vns, dict) else vns)
+               if isinstance(v, dict)]
+
+        def describe(v, reasons=()):
+            return {"id": v.get("id"), "label": v.get("label"),
+                    "vn_id": v.get("vn_id"), "matched_on": list(reasons)}
+
+        if vn_ref:
+            ref = str(vn_ref)
+            found = ([v for v in vns if v.get("id") == ref]
+                     or [v for v in vns if v.get("label") == ref]
+                     or [v for v in vns if str(v.get("vn_id")) == ref])
+            if not found:
+                raise ValueError(
+                    f"No VN matches vn_id='{ref}' (node id, label or VNI).")
+            if len(found) > 1:
+                raise ValueError(
+                    f"vn_id='{ref}' is ambiguous: {[describe(v) for v in found]}. "
+                    "Use the VN node id.")
+            return found[0]
+
+        conflicts = []
+        for v in vns:
+            reasons = []
+            if label and v.get("label") == label:
+                reasons.append("label")
+            if (vn_type == "vxlan" and cand_vni is not None
+                    and v.get("vn_type") == "vxlan"
+                    and str(v.get("vn_id")) == str(cand_vni)):
+                reasons.append("vni")
+            if vlan_id is not None and any(
+                    b.get("system_id") == bound_id and b.get("vlan_id") == vlan_id
+                    for b in v.get("bound_to") or []):
+                reasons.append("vlan_on_this_leaf")
+            if reasons:
+                conflicts.append((v, reasons))
+        if not conflicts:
+            return None
+        if reuse_existing and len(conflicts) == 1:
+            return conflicts[0][0]
+        listing = [describe(v, r) for v, r in conflicts]
+        if reuse_existing:
+            raise ValueError(
+                f"Several VNs match: {listing}. Pass 'vn_id' (node id) to choose.")
+        raise ValueError(
+            f"A VN already exists with the same label/VNI/VLAN: {listing}. "
+            "Creating it again would fail (VN_NAME_VXLAN_OVERLAPS / "
+            "VLAN_ID_NOT_UNIQUE_WITHIN_SYSTEM / VNI_ALREADY_USED_IN_VXLAN). "
+            "Pass 'vn_id' (node id, label or VNI) or reuse_existing=True to "
+            "assign the existing VN to the port.")
+
+    def _reuse_vn_on_port(
+        self, blueprint_id, existing, leaf_id, leaf_label, bound_id, vlan_id,
+        port, tagging, instantiate_port, gs_label, commit, commit_confirmed,
+    ):
+        """Assign an EXISTING VN to a leaf port: bind the VN to the leaf if
+        needed, then attach it to the port through its Connectivity Template."""
+        path = f"/blueprints/{blueprint_id}/virtual-networks/{existing['id']}"
+        vn = self._get(path)
+        vn_node_id, vn_label = vn["id"], vn.get("label")
+        steps = [{
+            "step": "reuse_vn", "vn_id": vn_node_id, "vn_label": vn_label,
+            "vn_type": vn.get("vn_type"), "vni": vn.get("vn_id"), "leaf": leaf_label,
+        }]
+
+        bound = [dict(b) for b in vn.get("bound_to") or []]
+        mine = next((b for b in bound if b.get("system_id") == bound_id), None)
+        if mine is None:
+            vl = vlan_id if vlan_id is not None else next(
+                (b["vlan_id"] for b in bound if b.get("vlan_id")), None)
+            if vl is None:
+                raise ValueError(
+                    f"VN '{vn_label}' is not bound to {leaf_label}: 'vlan_id' is required.")
+            bound.append({"system_id": bound_id, "vlan_id": vl, "access_switch_node_ids": []})
+            self._patch(path, {"bound_to": bound})
+            steps.append({
+                "step": "bind_vn", "status": "applied", "system_id": bound_id,
+                "vlan_id": vl,
+                "reason": f"VN was not yet present on {leaf_label}."})
+        elif vlan_id is not None and mine.get("vlan_id") not in (None, vlan_id):
+            steps.append({
+                "step": "bind_vn", "status": "warning",
+                "reason": (f"VN already uses VLAN {mine.get('vlan_id')} on {leaf_label}; "
+                           f"requested vlan_id={vlan_id} ignored.")})
+
+        port_assignment = self._assign_vn_to_port(
+            blueprint_id, vn_node_id, vn_label, vn.get("vn_type"), leaf_id,
+            leaf_label, port, tagging, instantiate_port, gs_label, steps)
+
+        cts = []
+        try:
+            cts = self.get_vn_connectivity_templates(blueprint_id, vn_node_id)
+        except (requests.exceptions.RequestException, ValueError, KeyError, TypeError):
+            pass
+        commit_result, commit_done = self._commit_step(
+            blueprint_id, commit, commit_confirmed,
+            f"Assign {vn_label} on {leaf_label}", steps)
+        return {
+            "blueprint_id": blueprint_id,
+            "reused_existing_vn": True,
+            "vn_id": vn_node_id,
+            "vn_label": vn_label,
+            "vlan_id": (mine or bound[-1]).get("vlan_id"),
+            "leaf": leaf_label,
+            "tagging": tagging,
+            "port_assignment": port_assignment,
+            "connectivity_templates": cts,
+            "ct_id": cts[0]["id"] if len(cts) == 1 else None,
+            "commit_requested": bool(commit),
+            "commit_confirmed": bool(commit_confirmed),
+            "committed": commit_done,
+            "commit_result": commit_result,
+            "steps": steps,
+        }
